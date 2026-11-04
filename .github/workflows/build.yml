@@ -1,0 +1,115 @@
+# Builds the god-server runner image on GitHub's machines, scans it, pushes it to GHCR and records
+# a provenance attestation for its digest. The server only accepts digests that have one from this
+# workflow on main (4-update.sh --image).
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"   # Mondays: picks up Ubuntu security fixes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/yaimgod-labs/runner-image
+
+jobs:
+  build:
+    runs-on: ubuntu-latest   # never the self-hosted runners: this repo is public
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Versions from the Dockerfile
+        id: v
+        run: |
+          runner=$(sed -n 's|^FROM ghcr.io/actions/actions-runner:\([0-9.]*\)@sha256:[0-9a-f]\{64\}$|\1|p' Dockerfile)
+          gh=$(sed -n 's/^ARG GH_VERSION=\([0-9.]*\)$/\1/p' Dockerfile)
+          [ -n "$runner" ] && [ -n "$gh" ] || { echo "::error::FROM must be actions-runner:<version>@sha256:<digest>, and GH_VERSION set"; exit 1; }
+          echo "tag=$runner-gh$gh" >>"$GITHUB_OUTPUT"
+          echo "runner $runner, gh $gh"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069   # v4.4.1
+
+      - name: Build for the scan
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc   # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: runner-image:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run --rm --user 1001:1001 runner-image:scan bash -c 'gh --version | head -1; ./config.sh --version; id -u'
+
+      - name: Scan, OS packages (fails on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25   # v0.36.0
+        with:
+          image-ref: runner-image:scan
+          vuln-type: os
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan, bundled libraries (report only; they come from upstream)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25   # v0.36.0
+        with:
+          image-ref: runner-image:scan
+          vuln-type: library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6   # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc   # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.v.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+
+      - name: Provenance attestation
+        if: steps.push.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8   # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: What to run on the server
+        if: steps.push.outcome == 'success'
+        run: |
+          ref="$IMAGE:${{ steps.v.outputs.tag }}@${{ steps.push.outputs.digest }}"
+          { echo "### Pushed"; echo; echo '```'; echo "sudo bash ~/hardening/runners/4-update.sh --image $ref"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+          echo "$ref"

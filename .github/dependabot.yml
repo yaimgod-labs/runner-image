@@ -1,0 +1,10 @@
+version: 2
+updates:
+  - package-ecosystem: docker      # the FROM line: a new runner release (tag and digest)
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
